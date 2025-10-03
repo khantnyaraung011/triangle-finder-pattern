@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Triangle QR — Live Camera Scan</title>
+  <style>
+    body{font-family:system-ui,Arial,sans-serif;background:#f6f7fb;color:#111;padding:18px}
+    .controls{max-width:720px;margin-bottom:12px;display:flex;gap:8px;flex-wrap:wrap}
+    input[type=text],select{padding:8px;border:1px solid #ccc;border-radius:6px}
+    button{padding:8px 12px;border-radius:8px;border:0;background:#2563eb;color:#fff;cursor:pointer}
+    canvas,video{background:#fff;border:1px solid #ddd;border-radius:6px;max-width:100%}
+    .row{display:flex;gap:12px;align-items:flex-start}
+    .col{flex:1}
+    label{font-size:13px;display:block;margin-bottom:6px}
+    .small{font-size:12px;color:#555;margin-top:6px}
+    .status{padding:8px;border-radius:6px;background:#fff;border:1px solid #e0e6f0}
+  </style>
+</head>
+<body>
+  <h2>Triangle QR — Generator + Live Camera (Template Match)</h2>
+
+  <div class="controls">
+    <input id="payload" type="text" style="flex:1" value="https://example.com/secret" />
+    <select id="version"><option>2</option><option selected>4</option><option>6</option></select>
+    <select id="ecLevel"><option value="L">L</option><option selected value="Q">Q</option><option value="H">H</option></select>
+    <input id="scale" type="number" value="6" style="width:80px" />
+    <button id="generateBtn">Generate</button>
+    <button id="downloadBtn">Download PNG</button>
+  </div>
+
+  <div class="row">
+    <div class="col">
+      <label>Generated QR (triangle finder)</label>
+      <canvas id="qrcanvas" width="360" height="360"></canvas>
+      <div class="small">Save/print this QR. For live scan, center this printed/screen QR inside camera view.</div>
+    </div>
+
+    <div style="width:420px">
+      <label>Live Camera</label>
+      <video id="video" autoplay playsinline width="400" height="300" style="background:#000"></video>
+      <div style="display:flex;gap:8px;margin-top:8px">
+        <button id="startCam">Start Camera</button>
+        <button id="stopCam">Stop Camera</button>
+        <button id="tryMatch">Try Match Now</button>
+      </div>
+      <label class="small">Match threshold (lower = stricter)</label>
+      <input id="threshold" type="range" min="10" max="200" value="60" />
+      <div class="small">Current threshold: <span id="thrVal">60</span></div>
+      <div style="margin-top:8px" class="status" id="status">Status: idle</div>
+    </div>
+  </div>
+
+  <div style="margin-top:12px">
+    <button id="scanInternal">Scan (internal cached)</button>
+    <div id="out" class="small"></div>
+  </div>
+
+  <!-- qrcode lib (generator only) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js"></script>
+  <script>
+    // Elements
+    const payloadEl = document.getElementById('payload');
+    const genBtn = document.getElementById('generateBtn');
+    const downloadBtn = document.getElementById('downloadBtn');
+    const canvas = document.getElementById('qrcanvas');
+    const ctx = canvas.getContext('2d');
+    const scaleEl = document.getElementById('scale');
+    const versionEl = document.getElementById('version');
+    const ecEl = document.getElementById('ecLevel');
+    const out = document.getElementById('out');
+
+    // Camera elements
+    const video = document.getElementById('video');
+    const startCamBtn = document.getElementById('startCam');
+    const stopCamBtn = document.getElementById('stopCam');
+    const tryMatchBtn = document.getElementById('tryMatch');
+    const thresholdEl = document.getElementById('threshold');
+    const thrVal = document.getElementById('thrVal');
+    const statusBox = document.getElementById('status');
+    const scanInternalBtn = document.getElementById('scanInternal');
+
+    let lastPayload = null;
+    let lastThumb = null; // ImageData (grayscale) template
+    let lastThumbW = 64, lastThumbH = 64; // template size
+    let videoStream = null;
+    let liveInterval = null;
+
+    thrVal.textContent = thresholdEl.value;
+    thresholdEl.addEventListener('input', ()=> thrVal.textContent = thresholdEl.value);
+
+    // make QR matrix
+    function makeQRCodeMatrix(text, version, ecLevel) {
+      const qr = qrcode(version, ecLevel);
+      qr.addData(text);
+      qr.make();
+      const moduleCount = qr.getModuleCount();
+      const matrix = [];
+      for (let r = 0; r < moduleCount; r++) {
+        matrix[r] = [];
+        for (let c = 0; c < moduleCount; c++) {
+          matrix[r][c] = qr.isDark(r, c) ? 1 : 0;
+        }
+      }
+      return {matrix, moduleCount};
+    }
+
+    // remove standard finder modules from matrix
+    function clearFinderInMatrix(matrix, moduleCount){
+      const fpSize = 7;
+      const positions = [ [0,0], [moduleCount-fpSize,0], [0,moduleCount-fpSize] ];
+      positions.forEach(([cx,cy])=>{
+        for(let r=0;r<fpSize;r++){
+          for(let c=0;c<fpSize;c++){
+            matrix[cy+r][cx+c] = 0;
+          }
+        }
+      });
+    }
+
+    // draw matrix and add triangle finders (pure drawing, matrix already cleared)
+    function drawMatrixWithTriangles(meta, scale){
+      const {matrix, moduleCount} = meta;
+      scale = parseInt(scale,10) || 6;
+      const size = moduleCount * scale;
+      canvas.width = size; canvas.height = size;
+      ctx.clearRect(0,0,size,size);
+      ctx.fillStyle = '#fff'; ctx.fillRect(0,0,size,size);
+      // modules
+      for(let r=0;r<moduleCount;r++){
+        for(let c=0;c<moduleCount;c++){
+          ctx.fillStyle = matrix[r][c] ? '#000' : '#fff';
+          ctx.fillRect(c*scale, r*scale, scale, scale);
+        }
+      }
+      // triangles (cover area 7x7 modules)
+      const fpSize = 7;
+      const positions = [ [0,0], [moduleCount-fpSize,0], [0,moduleCount-fpSize] ];
+      ctx.fillStyle = '#000';
+      positions.forEach(([cx,cy])=>{
+        const x0 = cx*scale, y0 = cy*scale, s = fpSize*scale;
+        ctx.beginPath();
+        ctx.moveTo(x0, y0);
+        ctx.lineTo(x0+s, y0);
+        ctx.lineTo(x0, y0+s);
+        ctx.closePath();
+        ctx.fill();
+      });
+    }
+
+    // create small grayscale thumbnail of canvas for template matching
+    function createTemplateThumb(w=64, h=64){
+      const tmp = document.createElement('canvas');
+      tmp.width = w; tmp.height = h;
+      const tctx = tmp.getContext('2d');
+      // draw generated QR scaled to thumb
+      tctx.drawImage(canvas, 0, 0, w, h);
+      const id = tctx.getImageData(0,0,w,h);
+      const gray = new Uint8ClampedArray(w*h);
+      for(let i=0;i<w*h;i++){
+        const r = id.data[i*4], g = id.data[i*4+1], b = id.data[i*4+2];
+        // luminance
+        gray[i] = (0.299*r + 0.587*g + 0.114*b)|0;
+      }
+      lastThumb = gray;
+      lastThumbW = w; lastThumbH = h;
+    }
+
+    // compute RMS difference between two grayscale arrays (same length)
+    function rmsDiff(a, b){
+      let s = 0;
+      for(let i=0;i<a.length;i++){
+        const d = a[i] - b[i];
+        s += d*d;
+      }
+      return Math.sqrt(s / a.length);
+    }
+
+    // capture center crop from video, scale to thumbnail, grayscale
+    function captureCenterThumbFromVideo(w=64, h=64){
+      const vw = video.videoWidth, vh = video.videoHeight;
+      if(vw === 0 || vh === 0) return null;
+      // take square centered area sized to min(vw,vh)*0.8 to encourage QR filling center
+      const side = Math.min(vw, vh) * 0.9;
+      const sx = Math.floor((vw - side)/2), sy = Math.floor((vh - side)/2);
+      const tmp = document.createElement('canvas');
+      tmp.width = w; tmp.height = h;
+      const tctx = tmp.getContext('2d');
+      // draw scaled center crop into thumb
+      tctx.drawImage(video, sx, sy, side, side, 0, 0, w, h);
+      const id = tctx.getImageData(0,0,w,h);
+      const gray = new Uint8ClampedArray(w*h);
+      for(let i=0;i<w*h;i++){
+        const r = id.data[i*4], g = id.data[i*4+1], b = id.data[i*4+2];
+        gray[i] = (0.299*r + 0.587*g + 0.114*b)|0;
+      }
+      return gray;
+    }
+
+    // attempt match: capture center thumb and compare to template
+    function attemptMatch(){
+      if(!lastThumb) { statusBox.textContent = 'Status: no template — generate QR first'; return false; }
+      const sample = captureCenterThumbFromVideo(lastThumbW, lastThumbH);
+      if(!sample){ statusBox.textContent = 'Status: waiting for video...'; return false; }
+      const diff = rmsDiff(sample, lastThumb);
+      // smaller diff = more similar
+      statusBox.textContent = 'Status: diff=' + diff.toFixed(1);
+      const threshold = parseFloat(thresholdEl.value);
+      if(diff <= threshold){
+        // match found
+        out.textContent = 'LIVE MATCH: ' + lastPayload;
+        statusBox.textContent = 'Status: MATCH (diff=' + diff.toFixed(1) + ')';
+        return true;
+      }
+      return false;
+    }
+
+    // GENERATE button handler
+    genBtn.addEventListener('click', ()=>{
+      const text = payloadEl.value || '';
+      const version = parseInt(versionEl.value,10) || 4;
+      const ec = ecEl.value || 'Q';
+      const scale = parseInt(scaleEl.value,10) || 6;
+      try{
+        const meta = makeQRCodeMatrix(text, version, ec);
+        clearFinderInMatrix(meta.matrix, meta.moduleCount);
+        lastPayload = text;
+        drawMatrixWithTriangles(meta, scale);
+        // create template thumb for matching; choose 64 or 96 depending on module count for better accuracy
+        const thumbSize = (meta.moduleCount <= 33) ? 64 : 96;
+        createTemplateThumb(thumbSize, thumbSize);
+        out.textContent = 'Generated and template created for live matching.';
+      }catch(e){
+        out.textContent = 'Error: ' + e.message;
+      }
+    });
+
+    // Download
+    downloadBtn.addEventListener('click', ()=>{
+      const a = document.createElement('a');
+      a.href = canvas.toDataURL('image/png');
+      a.download = 'triangle-qr.png';
+      a.click();
+    });
+
+    // CAMERA control
+    startCamBtn.addEventListener('click', async ()=>{
+      if(videoStream) return;
+      try{
+        videoStream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment', width:{ideal:1280}, height:{ideal:720}}, audio:false});
+        video.srcObject = videoStream;
+        // start periodic checking
+        liveInterval = setInterval(()=> {
+          try {
+            attemptMatch();
+          } catch(e) { /* ignore frame errors */ }
+        }, 500); // check twice per second
+        statusBox.textContent = 'Status: camera running';
+      }catch(err){
+        statusBox.textContent = 'Camera error: ' + err.message;
+      }
+    });
+
+    stopCamBtn.addEventListener('click', ()=>{
+      if(videoStream){
+        const tracks = videoStream.getTracks();
+        tracks.forEach(t => t.stop());
+        video.srcObject = null;
+        videoStream = null;
+      }
+      if(liveInterval){ clearInterval(liveInterval); liveInterval = null; }
+      statusBox.textContent = 'Status: camera stopped';
+    });
+
+    tryMatchBtn.addEventListener('click', ()=> {
+      if(!videoStream){ statusBox.textContent = 'Start camera first.'; return; }
+      const ok = attemptMatch();
+      if(!ok) out.textContent = 'No match found (center frame). Move QR into center and try again.';
+    });
+
+    // Scan internal cached
+    scanInternalBtn.addEventListener('click', ()=>{
+      if(!lastPayload) { out.textContent = 'No generated payload cached.'; return; }
+      out.textContent = 'Internal scanner result: ' + lastPayload;
+    });
+
+    // Auto-generate initial sample
+    genBtn.click();
+  </script>
+</body>
+</html>
