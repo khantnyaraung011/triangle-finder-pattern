@@ -1,0 +1,1 @@
+# triangle-finder-pattern
